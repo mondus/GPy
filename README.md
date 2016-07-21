@@ -68,6 +68,16 @@ We've also had luck with [enthought](http://www.enthought.com). Install scipy 0.
 
 If you'd like to install from source, or want to contribute to the project (i.e. by sending pull requests via github), read on.
 
+	
+### Installing on Windows with GPU support
+
+Installation on Windows with GPU support requires some additional libraries and changes. First of all you need to install pycuda then install GPy. To install pyCUDA you will need to download a pre-compiled windows binary. Up to date versions are is available at [Christopher Gohlke's site](http://www.lfd.uci.edu/~gohlke/pythonlibs/#pycuda). e.g.
+
+	pip install pycuda-2016.1.1+cuda7518-cp35-cp35m-win_amd64.whl
+	pip install gpy
+	
+You will also need to modify your environment variables so that the Microsoft C compiler (cl.exe) is in you system or user PATH. Currently Visual Studio 2015 (VC 14.00) is not supported by pycuda so you will need to install Visual Studio 2013 (VC 12.00) or earlier. Only the Visual C++ components are required. Add the (C:\Program Files (x86)\Microsoft Visual Studio 12.0\VC\bin) directory to your windows path.
+
 ### Troubleshooting installation problems
 
 If you're having trouble installing GPy via `pip install GPy` here is a probable solution:
@@ -149,6 +159,15 @@ clone this git repository and add it to your path:
 The documentation is stored in doc/ and is compiled with the Sphinx Python documentation generator, and is written in the reStructuredText format.
 
 The Sphinx documentation is available here: http://sphinx-doc.org/latest/contents.html
+
+
+## Developing GPy library
+
+To develop the library and contribute then fork the GPy repository and issue a pull request with any modifications.
+
+To work on the library locally use the following from within a virtual or conda environment
+
+	pip install develop
 
 **Installing dependencies:**
 

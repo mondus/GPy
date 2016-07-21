@@ -241,7 +241,9 @@ class PSICOMP_RBF_GPU(PSICOMP_RBF):
         
         self.GPU_direct = GPU_direct
         self.gpuCache = None
-        
+
+        print('GPU CODE')
+
         self.threadnum = threadnum
         self.blocknum = blocknum
         module = SourceModule("#define THREADNUM "+str(self.threadnum)+"\n"+gpu_code)
