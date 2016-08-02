@@ -3,8 +3,10 @@ The module for psi-statistics for RBF kernel
 """
 
 import numpy as np
+import math
 from paramz.caching import Cache_this
 from . import PSICOMP_RBF
+import sys, traceback
 
 gpu_code = """
     // define THREADNUM
@@ -17,7 +19,22 @@ gpu_code = """
     #define IDX_MM(m1,m2) (m2*M+m1)
     #define IDX_NQB(n,q,b) ((b*Q+q)*N+n)
     #define IDX_QB(q,b) (b*Q+q)
+    #define IDX_PSI2_SM(a,b) (a*blockDim.x + b)
 
+    
+    //slow double atomic add (native for Pascal GPUs)
+    __device__ double atomicAdd(double* address, double val)
+    {
+        unsigned long long int* address_as_ull = (unsigned long long int*)address;
+        unsigned long long int old = *address_as_ull, assumed;
+        do {
+            assumed = old;
+                old = atomicCAS(address_as_ull, assumed,__double_as_longlong(val +
+                                   __longlong_as_double(assumed)));
+        } while (assumed != old);
+        return __longlong_as_double(old);
+    }
+    
     // Divide data evenly
     __device__ void divide_data(int total_data, int psize, int pidx, int *start, int *end) {
         int residue = (total_data)%psize;
@@ -84,6 +101,30 @@ gpu_code = """
             }
         }
     }
+	
+	/* Changes are
+	 * 1) No more dividing data. This is divided between the total threads and the block size changes dynamically. The result is much more threads and much better device utilisation.
+	 *
+	 */
+    __global__ void psi1computationsDEV(double *psi1, double *log_denom1, double var, double *l, double *Z, double *mu, double *S, int N, int M, int Q)
+    {
+        //int m_start, m_end;
+        //divide_data(M, gridDim.x, blockIdx.x, &m_start, &m_end);
+        
+        unsigned int n = threadIdx.x + blockDim.x*blockIdx.x;
+        unsigned int m = threadIdx.y + blockDim.y*blockIdx.y;
+		
+        if ((m < M) && (n < N)){
+			double log_psi1 = 0;
+            for(int q=0;q<Q;q++) {
+                double muZ = mu[IDX_NQ(n,q)]-Z[IDX_MQ(m,q)];
+                double Snq = S[IDX_NQ(n,q)];
+                double lq = l[q]*l[q];
+                log_psi1 += (muZ*muZ/(Snq+lq)+log_denom1[IDX_NQ(n,q)])/(-2.);
+            }
+            psi1[IDX_NM(n,m)] = var*exp(log_psi1);
+		}
+    }
     
     __global__ void psi2computations(double *psi2, double *psi2n, double *log_denom2, double var, double *l, double *Z, double *mu, double *S, int N, int M, int Q)
     {
@@ -119,6 +160,61 @@ gpu_code = """
             __syncthreads();
         }
     }
+    
+     __global__ void psi2computationsDEV(double *psi2, double *psi2n, double *log_denom2, double var, double *l, double *Z, double *mu, double *S, int N, int M, int Q)
+    {
+        extern __shared__ double psi2_local[];
+        
+        unsigned int psi2_idx = threadIdx.x + blockDim.x*blockIdx.x;   //range 0 to (M+1)*(M/2)
+        unsigned int n = threadIdx.y + blockDim.y*blockIdx.y;          //range 0 to N
+        unsigned int psi2_max = (M+1)*(M/2);
+        
+        psi2_local[IDX_PSI2_SM(threadIdx.x, threadIdx.y)] = 0;
+        //diagonal indexing of symmetric M by M matrix
+        int m1 = int((sqrt(8.*psi2_idx+1.)-1.)/2.);
+        int m2 = psi2_idx - (m1+1)*m1/2;
+        
+        //check block range
+        if ((psi2_idx < psi2_max)&&(n < N)){  
+            double log_psi2_n = 0;
+            for(int q=0;q<Q;q++) {
+                double dZ = Z[IDX_MQ(m1,q)] - Z[IDX_MQ(m2,q)];
+                double muZhat = mu[IDX_NQ(n,q)]- (Z[IDX_MQ(m1,q)]+Z[IDX_MQ(m2,q)])/2.;
+                double Snq = S[IDX_NQ(n,q)];
+                double lq = l[q]*l[q];
+                log_psi2_n += dZ*dZ/(-4.*lq)-muZhat*muZhat/(2.*Snq+lq) + log_denom2[IDX_NQ(n,q)]/(-2.);
+            }
+            double exp_psi2_n = exp(log_psi2_n);
+            psi2n[IDX_NMM(n,m1,m2)] = var*var*exp_psi2_n;
+            //save to SM for reduction
+            psi2_local[IDX_PSI2_SM(threadIdx.x, threadIdx.y)] = exp_psi2_n;
+            
+            //diagonal mirror
+            if(m1!=m2) { 
+                psi2n[IDX_NMM(n,m2,m1)] = var*var*exp_psi2_n;
+            }
+        }
+        
+        //block level reduction (everything below could be removed if psi2 n is not required)
+        __syncthreads();
+        for(int s=blockDim.y/2;s>0;s=s>>1) {
+            if(threadIdx.y < s) {
+                psi2_local[IDX_PSI2_SM(threadIdx.x, threadIdx.y)] += psi2_local[IDX_PSI2_SM(threadIdx.x, s+threadIdx.y)];
+            }
+            __syncthreads();
+        }
+        
+        //grid level atomic reduction (could be moved into a recursive kernel call)
+        //requires block range check
+        if((threadIdx.y==0)&&(psi2_idx < psi2_max)&&(n < N)) {
+                atomicAdd(&psi2[IDX_MM(m1,m2)], var*var*psi2_local[IDX_PSI2_SM(threadIdx.x, 0)]);
+            if(m1!=m2) { 
+                atomicAdd(&psi2[IDX_MM(m2,m1)], var*var*psi2_local[IDX_PSI2_SM(threadIdx.x, 0)]); 
+            }
+        } 
+        
+    }
+
     
     __global__ void psi1compDer(double *dvar, double *dl, double *dZ, double *dmu, double *dS, double *dL_dpsi1, double *psi1, double var, double *l, double *Z, double *mu, double *S, int N, int M, int Q)
     {
@@ -230,6 +326,237 @@ gpu_code = """
         if(threadIdx.x==0) {dvar[blockIdx.x] += g_local[0]*2/var;}
     }
     """
+
+class PSICOMP_RBF_GPUDEV(PSICOMP_RBF):
+
+	# Do not copy a block number. This will be calculated dynamically
+	
+    def __init__(self, threadnum=1024, blocknum=32, GPU_direct=False):
+        self.fall_back = PSICOMP_RBF()
+        
+        from pycuda.compiler import SourceModule
+        import GPy.util.gpu_init
+        
+        self.GPU_direct = GPU_direct
+        self.gpuCache = None
+
+        # TODO: remove
+        self.blocknum = blocknum
+
+        # Thread number must be square number with a square that is a factor of 32 (warp size) as the module will use 2D grid blocks
+        self.threadnum = threadnum
+        blockwidth = math.sqrt(threadnum)
+        blockheight = blockwidth
+        if not float(blockwidth).is_integer():
+            raise ValueError('CUDA threadnum must be a square number')
+            
+        blockheight = int(blockheight)
+        blockwidth = int(blockwidth)
+        
+        if not blockwidth % 32 == 0:
+            raise ValueError('The square of CUDA threadnum must be a factor of 32')
+
+        self.blockwidth = blockwidth
+        self.blockheight = blockheight
+		
+        module = SourceModule("#define THREADNUM "+str(self.threadnum)+"\n"+gpu_code)
+        self.g_psi1computations = module.get_function('psi1computationsDEV')				# DEV version
+        self.g_psi1computations.prepare('PPdPPPPiii')
+        self.g_psi2computations = module.get_function('psi2computationsDEV')                # DEV version
+        self.g_psi2computations.prepare('PPPdPPPPiii')
+        self.g_psi1compDer = module.get_function('psi1compDer')
+        self.g_psi1compDer.prepare('PPPPPPPdPPPPiii')
+        self.g_psi2compDer = module.get_function('psi2compDer')
+        self.g_psi2compDer.prepare('PPPPPPPdPPPPiii')
+        self.g_compDenom = module.get_function('compDenom')
+        self.g_compDenom.prepare('PPPPii')
+        
+    def __deepcopy__(self, memo):
+        s = PSICOMP_RBF_GPUDEV(threadnum=self.threadnum, blocknum=self.blocknum, GPU_direct=self.GPU_direct)
+        memo[id(self)] = s 
+        return s
+    
+    def _initGPUCache(self, N, M, Q):
+        import pycuda.gpuarray as gpuarray
+        if self.gpuCache == None:
+            self.gpuCache = {
+                             'l_gpu'                :gpuarray.empty((Q,),np.float64,order='F'),
+                             'Z_gpu'                :gpuarray.empty((M,Q),np.float64,order='F'),
+                             'mu_gpu'               :gpuarray.empty((N,Q),np.float64,order='F'),
+                             'S_gpu'                :gpuarray.empty((N,Q),np.float64,order='F'),
+                             'psi1_gpu'             :gpuarray.empty((N,M),np.float64,order='F'),
+                             'psi2_gpu'             :gpuarray.empty((M,M),np.float64,order='F'),
+                             'psi2n_gpu'            :gpuarray.empty((N,M,M),np.float64,order='F'),
+                             'dL_dpsi1_gpu'         :gpuarray.empty((N,M),np.float64,order='F'),
+                             'dL_dpsi2_gpu'         :gpuarray.empty((M,M),np.float64,order='F'),
+                             'log_denom1_gpu'       :gpuarray.empty((N,Q),np.float64,order='F'),
+                             'log_denom2_gpu'       :gpuarray.empty((N,Q),np.float64,order='F'),
+                             # derivatives
+                             'dvar_gpu'             :gpuarray.empty((self.blocknum,),np.float64, order='F'),
+                             'dl_gpu'               :gpuarray.empty((Q,self.blocknum),np.float64, order='F'),
+                             'dZ_gpu'               :gpuarray.empty((M,Q),np.float64, order='F'),
+                             'dmu_gpu'              :gpuarray.empty((N,Q,self.blocknum),np.float64, order='F'),
+                             'dS_gpu'               :gpuarray.empty((N,Q,self.blocknum),np.float64, order='F'),
+                             # grad
+                             'grad_l_gpu'               :gpuarray.empty((Q,),np.float64, order='F'),
+                             'grad_mu_gpu'              :gpuarray.empty((N,Q,),np.float64, order='F'),
+                             'grad_S_gpu'               :gpuarray.empty((N,Q,),np.float64, order='F'),
+                             }
+        else:
+            assert N==self.gpuCache['mu_gpu'].shape[0]
+            assert M==self.gpuCache['Z_gpu'].shape[0]
+            assert Q==self.gpuCache['l_gpu'].shape[0]
+    
+    def sync_params(self, lengthscale, Z, mu, S):
+        if len(lengthscale)==1:
+            self.gpuCache['l_gpu'].fill(lengthscale)
+        else:
+            self.gpuCache['l_gpu'].set(np.asfortranarray(lengthscale))
+        self.gpuCache['Z_gpu'].set(np.asfortranarray(Z))
+        self.gpuCache['mu_gpu'].set(np.asfortranarray(mu))
+        self.gpuCache['S_gpu'].set(np.asfortranarray(S))
+        N,Q = self.gpuCache['S_gpu'].shape
+        # t=self.g_compDenom(self.gpuCache['log_denom1_gpu'],self.gpuCache['log_denom2_gpu'],self.gpuCache['l_gpu'],self.gpuCache['S_gpu'], np.int32(N), np.int32(Q), block=(self.threadnum,1,1), grid=(self.blocknum,1),time_kernel=True)
+        # print 'g_compDenom '+str(t)
+		#TODO: Launch correct block size
+        self.g_compDenom.prepared_call((self.blocknum,1),(self.threadnum,1,1), self.gpuCache['log_denom1_gpu'].gpudata,self.gpuCache['log_denom2_gpu'].gpudata,self.gpuCache['l_gpu'].gpudata,self.gpuCache['S_gpu'].gpudata, np.int32(N), np.int32(Q))
+        
+    def reset_derivative(self):
+        self.gpuCache['dvar_gpu'].fill(0.)
+        self.gpuCache['dl_gpu'].fill(0.)
+        self.gpuCache['dZ_gpu'].fill(0.)
+        self.gpuCache['dmu_gpu'].fill(0.)
+        self.gpuCache['dS_gpu'].fill(0.)
+        self.gpuCache['grad_l_gpu'].fill(0.)
+        self.gpuCache['grad_mu_gpu'].fill(0.)
+        self.gpuCache['grad_S_gpu'].fill(0.)
+    
+    def get_dimensions(self, Z, variational_posterior):
+        return variational_posterior.mean.shape[0], Z.shape[0], Z.shape[1]
+
+    def psicomputations(self, kern, Z, variational_posterior, return_psi2_n=False):
+        try:
+            return self._psicomputations(kern, Z, variational_posterior, return_psi2_n)
+        except:
+            print("GPU version failed. Falling back to CPU version...")
+            print("Details:", sys.exc_info()[0])
+            traceback.print_exc(file=sys.stdout)
+            return self.fall_back.psicomputations(kern, Z, variational_posterior, return_psi2_n)
+
+    @Cache_this(limit=3, ignore_args=(0,))
+    def _psicomputations(self, kern, Z, variational_posterior, return_psi2_n=False):
+        """
+        Z - MxQ
+        mu - NxQ
+        S - NxQ
+        """
+        variance, lengthscale = kern.variance, kern.lengthscale
+        N,M,Q = self.get_dimensions(Z, variational_posterior)
+        self._initGPUCache(N,M,Q)
+        self.sync_params(lengthscale, Z, variational_posterior.mean, variational_posterior.variance)
+        
+        psi1_gpu = self.gpuCache['psi1_gpu']
+        psi2_gpu = self.gpuCache['psi2_gpu']
+        psi2n_gpu = self.gpuCache['psi2n_gpu']
+        l_gpu = self.gpuCache['l_gpu']
+        Z_gpu = self.gpuCache['Z_gpu']
+        mu_gpu = self.gpuCache['mu_gpu']
+        S_gpu = self.gpuCache['S_gpu']
+        log_denom1_gpu = self.gpuCache['log_denom1_gpu']
+        log_denom2_gpu = self.gpuCache['log_denom2_gpu']
+
+        psi0 = np.empty((N,))
+        psi0[:] = variance
+		
+        # number of blocks is the number of blocks required to hold all M values given the fixed number of threads in a a block.
+        self.g_psi1computations.blocknum_x = int(math.ceil(float(N) / float(self.blockwidth)))
+        self.g_psi1computations.blocknum_y = int(math.ceil(float(M) / float(self.blockheight)))
+        self.g_psi1computations.prepared_call((self.g_psi1computations.blocknum_x,self.g_psi1computations.blocknum_y),(self.blockwidth,self.blockheight,1),psi1_gpu.gpudata, log_denom1_gpu.gpudata, np.float64(variance),l_gpu.gpudata,Z_gpu.gpudata,mu_gpu.gpudata,S_gpu.gpudata, np.int32(N), np.int32(M), np.int32(Q))
+
+        # number of blocks is the number of blocks required to hold all M values given the fixed number of threads in a a block.
+        self.g_psi1computations.blocknum_x = int(math.ceil(float((M+1)*M/2) / float(self.blockwidth)))
+        self.g_psi1computations.blocknum_y = int(math.ceil(float(N) / float(self.blockheight)))
+        self.g_psi1computations.smem = 8*int(self.blockheight)*int(self.blockwidth); # IMPORTANT: Assumes that we are always using doubles
+        self.g_psi2computations.prepared_call((self.g_psi1computations.blocknum_x,self.g_psi1computations.blocknum_y),(self.blockwidth,self.blockheight,1),psi2_gpu.gpudata, psi2n_gpu.gpudata, log_denom2_gpu.gpudata, np.float64(variance),l_gpu.gpudata,Z_gpu.gpudata,mu_gpu.gpudata,S_gpu.gpudata, np.int32(N), np.int32(M), np.int32(Q), shared_size=self.g_psi1computations.smem )
+
+	    # t = self.g_psi1computations(psi1_gpu, log_denom1_gpu, np.float64(variance),l_gpu,Z_gpu,mu_gpu,S_gpu, np.int32(N), np.int32(M), np.int32(Q), block=(self.threadnum,1,1), grid=(self.blocknum,1),time_kernel=True)
+        # print 'g_psi1computations '+str(t)
+        # t = self.g_psi2computations(psi2_gpu, psi2n_gpu, log_denom2_gpu, np.float64(variance),l_gpu,Z_gpu,mu_gpu,S_gpu, np.int32(N), np.int32(M), np.int32(Q), block=(self.threadnum,1,1), grid=(self.blocknum,1),time_kernel=True)
+        # print 'g_psi2computations '+str(t)
+         
+        if self.GPU_direct:
+            return psi0, psi1_gpu, psi2_gpu
+        else:
+            if return_psi2_n:
+                return psi0, psi1_gpu.get(), psi2n_gpu.get()
+            else:
+                return psi0, psi1_gpu.get(), psi2_gpu.get()
+        
+    def psiDerivativecomputations(self, kern, dL_dpsi0, dL_dpsi1, dL_dpsi2, Z, variational_posterior):
+        try:
+            return self._psiDerivativecomputations(kern, dL_dpsi0, dL_dpsi1, dL_dpsi2, Z, variational_posterior)
+        except:
+            return self.fall_back.psiDerivativecomputations(kern, dL_dpsi0, dL_dpsi1, dL_dpsi2, Z, variational_posterior)
+
+    @Cache_this(limit=3, ignore_args=(0,2,3,4))
+    def _psiDerivativecomputations(self, kern, dL_dpsi0, dL_dpsi1, dL_dpsi2, Z, variational_posterior):
+        # resolve the requirement of dL_dpsi2 to be symmetric
+        if len(dL_dpsi2.shape)==2: dL_dpsi2 = (dL_dpsi2+dL_dpsi2.T)/2
+        else: dL_dpsi2  = (dL_dpsi2+ np.swapaxes(dL_dpsi2, 1,2))/2
+    
+        variance, lengthscale = kern.variance, kern.lengthscale
+        from ....util.linalg_gpu import sum_axis
+        ARD = (len(lengthscale)!=1)
+        
+        N,M,Q = self.get_dimensions(Z, variational_posterior)
+        psi1_gpu = self.gpuCache['psi1_gpu']
+        psi2n_gpu = self.gpuCache['psi2n_gpu']
+        l_gpu = self.gpuCache['l_gpu']
+        Z_gpu = self.gpuCache['Z_gpu']
+        mu_gpu = self.gpuCache['mu_gpu']
+        S_gpu = self.gpuCache['S_gpu']
+        dvar_gpu = self.gpuCache['dvar_gpu']
+        dl_gpu = self.gpuCache['dl_gpu']
+        dZ_gpu = self.gpuCache['dZ_gpu']
+        dmu_gpu = self.gpuCache['dmu_gpu']
+        dS_gpu = self.gpuCache['dS_gpu']
+        grad_l_gpu = self.gpuCache['grad_l_gpu']
+        grad_mu_gpu = self.gpuCache['grad_mu_gpu']
+        grad_S_gpu = self.gpuCache['grad_S_gpu']
+        
+        if self.GPU_direct:
+            dL_dpsi1_gpu = dL_dpsi1
+            dL_dpsi2_gpu = dL_dpsi2
+            dL_dpsi0_sum = dL_dpsi0.get().sum() #gpuarray.sum(dL_dpsi0).get()
+        else:
+            dL_dpsi1_gpu = self.gpuCache['dL_dpsi1_gpu']
+            dL_dpsi2_gpu = self.gpuCache['dL_dpsi2_gpu']
+            dL_dpsi1_gpu.set(np.asfortranarray(dL_dpsi1))
+            dL_dpsi2_gpu.set(np.asfortranarray(dL_dpsi2))
+            dL_dpsi0_sum = dL_dpsi0.sum()
+
+        self.reset_derivative()
+        # t=self.g_psi1compDer(dvar_gpu,dl_gpu,dZ_gpu,dmu_gpu,dS_gpu,dL_dpsi1_gpu,psi1_gpu, np.float64(variance),l_gpu,Z_gpu,mu_gpu,S_gpu, np.int32(N), np.int32(M), np.int32(Q), block=(self.threadnum,1,1), grid=(self.blocknum,1),time_kernel=True)
+        # print 'g_psi1compDer '+str(t)
+        # t=self.g_psi2compDer(dvar_gpu,dl_gpu,dZ_gpu,dmu_gpu,dS_gpu,dL_dpsi2_gpu,psi2n_gpu, np.float64(variance),l_gpu,Z_gpu,mu_gpu,S_gpu, np.int32(N), np.int32(M), np.int32(Q), block=(self.threadnum,1,1), grid=(self.blocknum,1),time_kernel=True)
+        # print 'g_psi2compDer '+str(t)
+        self.g_psi1compDer.prepared_call((self.blocknum,1),(self.threadnum,1,1),dvar_gpu.gpudata,dl_gpu.gpudata,dZ_gpu.gpudata,dmu_gpu.gpudata,dS_gpu.gpudata,dL_dpsi1_gpu.gpudata,psi1_gpu.gpudata, np.float64(variance),l_gpu.gpudata,Z_gpu.gpudata,mu_gpu.gpudata,S_gpu.gpudata, np.int32(N), np.int32(M), np.int32(Q))
+        self.g_psi2compDer.prepared_call((self.blocknum,1),(self.threadnum,1,1),dvar_gpu.gpudata,dl_gpu.gpudata,dZ_gpu.gpudata,dmu_gpu.gpudata,dS_gpu.gpudata,dL_dpsi2_gpu.gpudata,psi2n_gpu.gpudata, np.float64(variance),l_gpu.gpudata,Z_gpu.gpudata,mu_gpu.gpudata,S_gpu.gpudata, np.int32(N), np.int32(M), np.int32(Q))
+
+        dL_dvar = dL_dpsi0_sum + dvar_gpu.get().sum()#gpuarray.sum(dvar_gpu).get()
+        sum_axis(grad_mu_gpu,dmu_gpu,N*Q,self.blocknum)
+        dL_dmu = grad_mu_gpu.get()
+        sum_axis(grad_S_gpu,dS_gpu,N*Q,self.blocknum)
+        dL_dS = grad_S_gpu.get()
+        dL_dZ = dZ_gpu.get()
+        if ARD:
+            sum_axis(grad_l_gpu,dl_gpu,Q,self.blocknum)
+            dL_dlengscale = grad_l_gpu.get()
+        else:
+            dL_dlengscale = dl_gpu.get().sum() #gpuarray.sum(dl_gpu).get()
+            
+        return dL_dvar, dL_dlengscale, dL_dZ, dL_dmu, dL_dS
+    
 
 class PSICOMP_RBF_GPU(PSICOMP_RBF):
 
