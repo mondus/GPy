@@ -161,7 +161,7 @@ gpu_code = """
         }
     }
     
-     __global__ void psi2computationsDEV(double *psi2, double *psi2n, double *log_denom2, double var, double *l, double *Z, double *mu, double *S, int N, int M, int Q)
+    __global__ void psi2computationsDEV(double *psi2, double *psi2n, const double* __restrict__ log_denom2, double var, const double* __restrict__ l, const double* __restrict__ Z, const double* __restrict__ mu, const double* __restrict__ S, int N, int M, int Q)
     {
         extern __shared__ double psi2_local[];
         
